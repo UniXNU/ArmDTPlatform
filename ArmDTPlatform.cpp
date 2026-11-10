@@ -36,12 +36,95 @@ public:
   bool configure (IOService *provider) override;
   const char *deleteList (void) override;
   const char *excludeList (void) override;
+  long getGMTTimeOfDay (void) override;
+  void setGMTTimeOfDay (long secs) override;
 private:
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
 };
 
 OSDefineMetaClassAndStructors (ArmDTPlatform, IODTPlatformExpert)
+
+// The calendar at boot. XNU sets it from getGMTTimeOfDay() before any process runs. The base class answers 0, so on a platform
+// without a clock driver the system started in 1970 and jumped half a century when the network time arrived. Software that keeps
+// periodic timers by the calendar then replays the whole gap: on sheng (macOS 27.3) rpcsvchost's timer loop kept a core busy for
+// minutes after every boot, and every periodic background activity was overdue at once.
+// A board's clock driver answers through armdt_platform_clock_read (seconds since 1970, 0 on success) and learns the time the
+// system sets through armdt_platform_clock_set; both are optional. Whatever the clock says, the calendar never starts before the
+// kernel it runs was built (the date in the kernel's version string, less a day for its time zone): without a clock the later
+// correction is then the time since that build, not the time since 1970.
+extern "C" {
+int armdt_platform_clock_read (uint64_t *seconds) __attribute__ ((weak_import));
+void armdt_platform_clock_set (uint64_t seconds) __attribute__ ((weak_import));
+extern const char version[];
+volatile uint64_t armdt_platform_clock_floor = 0;   // the build date found in the version string, for the boot log
+}
+
+namespace {
+// "Darwin Kernel Version 27.3.0: Fri Oct 30 02:01:13 PDT 2026; root:..." -> seconds since 1970 of that date, 0 if not in this form.
+uint64_t
+versionSeconds (const char *text)
+{
+  static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char *p = text;
+  while (*p && !(p[0] == ':' && p[1] == ' ')) ++p;
+  if (!*p) return 0;
+  p += 2;
+  while (*p && *p != ' ') ++p;                      // weekday
+  if (*p != ' ') return 0;
+  ++p;
+  unsigned month = 12;
+  for (unsigned i = 0; i < 12; ++i) {
+    if (p[0] == months[3 * i] && p[1] == months[3 * i + 1] && p[2] == months[3 * i + 2]) month = i;
+  }
+  if (month == 12 || p[3] != ' ') return 0;
+  p += 4;
+  auto number = [&p] (unsigned limit) -> unsigned {
+    unsigned value = 0, digits = 0;
+    while (*p == ' ') ++p;
+    while (*p >= '0' && *p <= '9' && digits < 4) {value = value * 10 + (unsigned) (*p - '0'); ++p; ++digits;}
+    return digits && value <= limit ? value : limit + 1;
+  };
+  const unsigned day = number (31);
+  const unsigned hour = number (23);
+  if (*p != ':') return 0;
+  ++p;
+  const unsigned minute = number (59);
+  if (*p != ':') return 0;
+  ++p;
+  const unsigned second = number (60);
+  while (*p == ' ') ++p;
+  while (*p && *p != ' ') ++p;                      // time zone name
+  const unsigned year = number (9999);
+  if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60 || year < 2020 || year > 9999) return 0;
+  // Days since 1970-01-01 of a civil date (months counted from March).
+  const unsigned y = month < 2 ? year - 1 : year, m = month < 2 ? month + 10 : month - 2;
+  const uint64_t era = y / 400, yoe = y - era * 400, doy = (153 * m + 2) / 5 + day - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  const uint64_t days = era * 146097 + doe - 719468;
+  return days * 86400 + hour * 3600 + minute * 60 + second;
+}
+}
+
+long
+ArmDTPlatform::getGMTTimeOfDay (void)
+{
+  uint64_t built = versionSeconds (version);
+  if (built > 86400) built -= 86400;                // the version's time is local to where it was built
+  armdt_platform_clock_floor = built;
+  uint64_t now = 0;
+  if (&armdt_platform_clock_read != nullptr && armdt_platform_clock_read (&now) == 0 && now >= built) {
+    return (long) now;
+  }
+  return (long) built;
+}
+
+void
+ArmDTPlatform::setGMTTimeOfDay (long secs)
+{
+  if (&armdt_platform_clock_set != nullptr && secs > 0) {
+    armdt_platform_clock_set ((uint64_t) secs);
+  }
+}
 
 // Serialized empty name lists: XNU's processTopLevel() treats a null pointer
 // as "every entry" (remove every child), not as "nothing". An empty list
@@ -155,7 +238,7 @@ bool ArmDTPlatform::configure (IOService *provider)
   // XNU's IOKitInitializeTime waits up to 30 s for the "IORTC" resource before it sets the calendar. On a platform whose device
   // tree describes no real-time clock (/arm-io/rtc) no driver will ever publish it, and every boot stalled for nearly the whole
   // timeout (sheng: 28 s of silence before storage starts, macOS run43/run44/run47). Such a platform says at once that there is
-  // nothing to wait for. The calendar starts from getGMTTimeOfDay() as before (0 without a clock) and the time daemon sets it.
+  // nothing to wait for. The calendar starts from getGMTTimeOfDay() below and the time daemon sets it.
   IORegistryEntry *rtc = provider->childFromPath ("arm-io/rtc", gIODTPlane);
   if (rtc != nullptr) {
     rtc->release ();
