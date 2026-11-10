@@ -49,15 +49,21 @@ OSDefineMetaClassAndStructors (ArmDTPlatform, IODTPlatformExpert)
 // without a clock driver the system started in 1970 and jumped half a century when the network time arrived. Software that keeps
 // periodic timers by the calendar then replays the whole gap: on sheng (macOS 27.3) rpcsvchost's timer loop kept a core busy for
 // minutes after every boot, and every periodic background activity was overdue at once.
-// A board's clock driver answers through armdt_platform_clock_read (seconds since 1970, 0 on success) and learns the time the
-// system sets through armdt_platform_clock_set; both are optional. Whatever the clock says, the calendar never starts before the
+// A board's clock driver registers with armdt_platform_clock_register: a read function (seconds since 1970, 0 on success) and a
+// set function that learns the time the system sets; either may be null. Whatever the clock says, the calendar never starts before the
 // kernel it runs was built (the date in the kernel's version string, less a day for its time zone): without a clock the later
 // correction is then the time since that build, not the time since 1970.
 extern "C" {
-int armdt_platform_clock_read (uint64_t *seconds) __attribute__ ((weak_import));
-void armdt_platform_clock_set (uint64_t seconds) __attribute__ ((weak_import));
 extern const char version[];
 volatile uint64_t armdt_platform_clock_floor = 0;   // the build date found in the version string, for the boot log
+static int (*volatile gClockRead) (uint64_t *);
+static void (*volatile gClockSet) (uint64_t);
+void
+armdt_platform_clock_register (int (*read) (uint64_t *seconds), void (*set) (uint64_t seconds))
+{
+  __atomic_store_n (&gClockSet, set, __ATOMIC_RELEASE);
+  __atomic_store_n (&gClockRead, read, __ATOMIC_RELEASE);
+}
 }
 
 namespace {
@@ -112,7 +118,8 @@ ArmDTPlatform::getGMTTimeOfDay (void)
   if (built > 86400) built -= 86400;                // the version's time is local to where it was built
   armdt_platform_clock_floor = built;
   uint64_t now = 0;
-  if (&armdt_platform_clock_read != nullptr && armdt_platform_clock_read (&now) == 0 && now >= built) {
+  int (*read) (uint64_t *) = __atomic_load_n (&gClockRead, __ATOMIC_ACQUIRE);
+  if (read != nullptr && read (&now) == 0 && now >= built) {
     return (long) now;
   }
   return (long) built;
@@ -121,8 +128,9 @@ ArmDTPlatform::getGMTTimeOfDay (void)
 void
 ArmDTPlatform::setGMTTimeOfDay (long secs)
 {
-  if (&armdt_platform_clock_set != nullptr && secs > 0) {
-    armdt_platform_clock_set ((uint64_t) secs);
+  void (*set) (uint64_t) = __atomic_load_n (&gClockSet, __ATOMIC_ACQUIRE);
+  if (set != nullptr && secs > 0) {
+    set ((uint64_t) secs);
   }
 }
 
