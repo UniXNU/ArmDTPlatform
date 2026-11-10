@@ -141,7 +141,7 @@ bool ArmDTPlatform::configure (IOService *provider)
     return false;
   }
   unsigned platformStage = 0;
-  PE_parse_boot_argn ("sheng-platform-stage", &platformStage, sizeof (platformStage));
+  PE_parse_boot_argn ("platform-stage", &platformStage, sizeof (platformStage));
   if (platformStage == 1) {
     platformStageReset ();
   }
@@ -198,7 +198,7 @@ bool ArmDTPlatform::configure (IOService *provider)
   // configuration and panic before publishing the service. The payload's
   // panic-screen probe makes this observable without a serial console.
   unsigned platformProbe = 0;
-  PE_parse_boot_argn ("sheng-platform-panic", &platformProbe, sizeof (platformProbe));
+  PE_parse_boot_argn ("platform-panic", &platformProbe, sizeof (platformProbe));
   if (platformProbe != 0 || platformStage == 4) {
     platformStageReset ();
   }
