@@ -152,6 +152,16 @@ bool ArmDTPlatform::configure (IOService *provider)
   if (!IODTPlatformExpert::configure (provider)) {
     return false;
   }
+  // XNU's IOKitInitializeTime waits up to 30 s for the "IORTC" resource before it sets the calendar. On a platform whose device
+  // tree describes no real-time clock (/arm-io/rtc) no driver will ever publish it, and every boot stalled for nearly the whole
+  // timeout (sheng: 28 s of silence before storage starts, macOS run43/run44/run47). Such a platform says at once that there is
+  // nothing to wait for. The calendar starts from getGMTTimeOfDay() as before (0 without a clock) and the time daemon sets it.
+  IORegistryEntry *rtc = provider->childFromPath ("arm-io/rtc", gIODTPlane);
+  if (rtc != nullptr) {
+    rtc->release ();
+  } else {
+    publishResource ("IORTC");
+  }
   if (platformStage == 2) {
     platformStageReset ();
   }
