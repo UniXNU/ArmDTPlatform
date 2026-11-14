@@ -38,6 +38,7 @@ public:
   const char *excludeList (void) override;
   long getGMTTimeOfDay (void) override;
   void setGMTTimeOfDay (long secs) override;
+  int haltRestart (unsigned int type) override;
 private:
   bool hasNVRAMProxy (IOService *provider);
   bool createDeviceNubs (IOService *provider);
@@ -211,6 +212,56 @@ static void platformStageReset (void)
   for (;;) { __asm__ volatile ("wfe"); }
 }
 
+// The PSCI conduit the device tree's /psci node names (method "smc" or "hvc"); none without the node.
+enum PsciConduit { kPsciNone, kPsciSmc, kPsciHvc };
+static PsciConduit gPsciConduit = kPsciNone;
+
+static PsciConduit psciConduit (IOService *root)
+{
+  IORegistryEntry *psci = root->childFromPath ("psci", gIODTPlane);
+  if (psci == nullptr) { return kPsciNone; }
+  PsciConduit conduit = kPsciNone;
+  OSData *method = OSDynamicCast (OSData, psci->getProperty ("method"));
+  if (method != nullptr && method->getLength () >= 4) {
+    const char *text = static_cast<const char *> (method->getBytesNoCopy ());
+    if (!strncmp (text, "smc", 4)) { conduit = kPsciSmc; }
+    else if (!strncmp (text, "hvc", 4)) { conduit = kPsciHvc; }
+  }
+  psci->release ();
+  return conduit;
+}
+
+// PSCI 0.2 SYSTEM_OFF and SYSTEM_RESET. Neither returns on success; a return means the call was refused, and the caller
+// gets the generic answer.
+static uint64_t psciSystemCall (uint64_t function)
+{
+  register uint64_t x0 __asm__ ("x0") = function;
+  register uint64_t x1 __asm__ ("x1") = 0;
+  register uint64_t x2 __asm__ ("x2") = 0;
+  register uint64_t x3 __asm__ ("x3") = 0;
+  if (gPsciConduit == kPsciHvc) {
+    __asm__ volatile ("hvc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  } else {
+    __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  }
+  return x0;
+}
+
+// Power off and restart. Without them the generic platform expert has nothing to call, the CPU idles after the shutdown
+// notifications, and PEHaltRestart's 30 s timer panics ("Halt/Restart Timed Out"). Panic restarts are left to the generic
+// path, so a panic stays on screen. A device tree without /psci keeps the generic behaviour.
+int ArmDTPlatform::haltRestart (unsigned int type)
+{
+  if (gPsciConduit != kPsciNone && (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU)) {
+    uint64_t result = psciSystemCall (0x84000008);  // SYSTEM_OFF
+    IOLog ("ArmDTPlatform: PSCI SYSTEM_OFF returned %lld\n", (long long) result);
+  } else if (gPsciConduit != kPsciNone && type == kPERestartCPU) {
+    uint64_t result = psciSystemCall (0x84000009);  // SYSTEM_RESET
+    IOLog ("ArmDTPlatform: PSCI SYSTEM_RESET returned %lld\n", (long long) result);
+  }
+  return IODTPlatformExpert::haltRestart (type);
+}
+
 bool ArmDTPlatform::configure (IOService *provider)
 {
   IORegistryEntry *cpus = provider->childFromPath ("cpus", gIODTPlane);
@@ -227,6 +278,7 @@ bool ArmDTPlatform::configure (IOService *provider)
     IOLog ("ArmDTPlatform: required /cpus, /arm-io, /defaults or /options node is absent\n");
     return false;
   }
+  gPsciConduit = psciConduit (provider);
   if (!hasNVRAMProxy (provider)) {
     IOLog ("ArmDTPlatform: /chosen does not supply a usable CHRP NVRAM proxy\n");
     return false;
